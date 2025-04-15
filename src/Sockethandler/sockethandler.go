@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"files/packages/src/Response_generation"
 	"fmt"
 	"html"
 	"net"
@@ -10,6 +11,15 @@ import (
 func Handleconnections(conn net.Conn) {
 	// Closing the connection when we are done
 	defer conn.Close()
+
+	req := &response.Request{
+		Path: "/api", // Example path
+		Header: map[string]string{
+			"Accept": "application/json",
+		},
+	}
+
+	response.HandleRequest(conn, req)
 
 	// Reading the incoming requests
 
