@@ -1,20 +1,25 @@
+// TCP echo server
+
 package main
 
 import (
+	"bufio"
 	"fmt"
+	"io"
 	"net"
+	"os"
 )
 
 func main() {
 	// Creating a Listening socket
-	network := "tcp"
-	address := "127.0.0.1:8080"
-	listener, err := net.Listen(network, address)
+	port := ":8080"
+	listener, err := net.Listen("tcp", port)
 	if err != nil {
 		fmt.Printf("Error creating listening socket: %v\n", err)
+		os.Exit(1)
 	}
 	defer listener.Close()
-	fmt.Printf("Listening on %s://%s\n", network, listener.Addr())
+	fmt.Printf("Listening on %s:%s\n", "tcp", listener.Addr())
 
 	// Accepting new connections on the listening socket
 	for {
@@ -30,17 +35,24 @@ func main() {
 }
 
 func handleConnection(conn net.Conn) {
-	defer conn.Close()                          // Delays the execution of conn.Close() until handleConnection() has been properly executed
-	fmt.Println(conn, "Hello from my goserver") // Sends the given data back to the connected client
+	defer conn.Close() // Delays the execution of conn.Close() until handleConnection() has been properly executed. conn.Close() closes the connection
+	reader := bufio.NewReader(conn)
+	for {
+		// read client request data
+		bytes, err := reader.ReadBytes(byte('\n'))
+		if err != nil {
+			if err != io.EOF {
+				fmt.Println("failed to read data, err:", err)
+			}
+			return
+		}
+		fmt.Printf("request: %s", bytes)
 
-	// Read data from the client
-
-	buffer := make([]byte, 1024) // Message buffer
-	n, err := conn.Read(buffer)  // conn.Read() reads the message in the buffer
-	if err != nil {
-		fmt.Println(err)
+		_, writeErr := conn.Write(bytes)
+		if writeErr != nil {
+			fmt.Println("failed to write response, err:", writeErr)
+			return // Or handle the error appropriately
+		}
+		fmt.Printf("Response: %v", bytes)
 	}
-	received := string(buffer[:n])
-	fmt.Println(received)
-	fmt.Fprintf(conn, "Thanks for your message: %s", received)
 }
