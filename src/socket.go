@@ -31,6 +31,7 @@ func main() {
 
 		fmt.Printf("Accepted connection from: %s\n", conn.RemoteAddr())
 		go handleConnection(conn)
+		go Serveclient(conn)
 	}
 }
 
