@@ -48,24 +48,24 @@ func SplitMessage(buff *Dynbuff) ([]byte, bool) { // SplitMessage() processes th
 
 func Buffpop(buff *Dynbuff, length int) {
 	if length <= 0 {
-		return
+		return // returns nothing if the length value is 0 or a negative number
 	}
-	if length >= buff.length {
+	if length >= buff.length { // checks if the no. of bytes you want to remove is greater than or equal to the buffer's valid length
 		buff.data.Reset() // Effectively clears the buffer
 		buff.length = 0
 		return
 	}
 
-	remaining := buff.data.Bytes()[length:]
-	newBuffer := bytes.NewBuffer(remaining)
+	remaining := buff.data.Bytes()[length:] // This effectively represents the data that remains after you conceptually remove the first length bytes.
+	newBuffer := bytes.NewBuffer(remaining) // This creates and initialize a new buffer from the remaining data
 	buff.data = *newBuffer
-	buff.length -= length
+	buff.length -= length // buff.length is updated by subtracting the number(len) of bytes from it
 }
 
 func Serveclient(conn net.Conn) {
 	defer conn.Close() // Ensures the connection is close when the function exits
 	buff := &Dynbuff{data: bytes.Buffer{}, length: 0}
-	reader := bytes.NewReader(nil) // Reader for the buffer
+	reader := bytes.NewReader(nil) // Initiates a new Reader function for the buffer
 
 	for {
 		// Trying to get one message from the buffer
@@ -81,28 +81,28 @@ func Serveclient(conn net.Conn) {
 				}
 			}
 			if n > 0 {
-				bytebuffer := bytes.NewBuffer(data[:n])
+				bytebuffer := bytes.NewBuffer(data[:n]) // creates a new buffer for the byte slice (from the beginning of the slice to n)
 				Buffpush(buff, bytebuffer)
 				// Update the reader to reflect the new buffer content
-				reader.Reset(buff.data.Bytes())
-				continue // Get some more data and try again
+				reader.Reset(buff.data.Bytes()) // Resets the byte slice to be reading from "buff.data.Bytes()"
+				continue                        // Get some more data and try again
 			}
 			fmt.Println("Client disconnected.")
 			return
 		}
-		if bytes.Equal(message, []byte("quit\n")) {
-			_, err := conn.Write([]byte("Bye.\n"))
+		if bytes.Equal(message, []byte("quit\n")) { // checks if message and []byte("quit\n") is the same length and contain the same bytes
+			_, err := conn.Write([]byte("Bye.\n")) // Writes "Bye" to the connection
 			if err != nil {
 				fmt.Println("Error writing to connection:", err)
 			}
 			// conn.Close() at the defer will handle closing.
 			return
 		} else {
-			reply := bytes.Join([][]byte{[]byte("Echo: "), message}, nil)
+			reply := bytes.Join([][]byte{[]byte("Echo: "), message}, nil) // concatenates both slices
 			_, err := conn.Write(reply)
 			if err != nil {
 				fmt.Println("Error writing to connection:", err)
 			}
 		}
-	}
+	} // Loops end here
 }
