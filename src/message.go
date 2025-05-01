@@ -1,11 +1,14 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"os"
 )
 
 // A parsed HTTP request header
@@ -28,7 +31,7 @@ type Dynbuff struct {
 }
 
 // appending data to dynamic buffer
-func Buffpush(buff *Dynbuff, data *bytes.Buffer) {
+func Buffpush(buff *Dynbuff, data *bytes.Buffer) { // This pushes data to the buffer
 	Databytes := data.Bytes()            // databytes creates an empty buffer
 	_, err := buff.data.Write(Databytes) // bytes.Buffer.Write returns two values (int, err)
 	if err != nil {
@@ -36,22 +39,23 @@ func Buffpush(buff *Dynbuff, data *bytes.Buffer) {
 		fmt.Println("Error writing to buffer:", err)
 		return
 	}
-	buff.length += len(Databytes) // length of bytes of databytes is subtracted from buff.length
+	buff.length += len(Databytes) // buffer length increases as you push data to the buffer
 }
 
 func SplitMessage(buff *Dynbuff) ([]byte, bool) { // SplitMessage() processes the Dynbuff to extract complete messages separated by the newline character (\n)
 	index := bytes.IndexByte(buff.data.Bytes()[:buff.length], '\n') // locate the first occurence (first index) of the newline char (\n)
-	if buff.length < 0 {
-		return nil, false // incomplete message
-	}
 
-	message := make([]byte, index+1) // Creates a new Buffer containing the message up to (and including) the newline
-	_, err := buff.data.Read(message)
-	if err != nil {
+	if index == -1 { // Incomplete message: newline not found
 		return nil, false
 	}
 
-	Buffpop(buff, index+1)
+	message := make([]byte, index+1)  // Creates a new Buffer containing the message up to (and including) the newline
+	_, err := buff.data.Read(message) // This advances the buffer read pointer
+	if err != nil {
+		return nil, false // should not happen if the buffer is within bounds
+	}
+
+	Buffpop(buff, index+1) // Pops the processed image
 
 	return message, true
 }
@@ -81,71 +85,75 @@ func StatusError() error {
 	return &HTTPerror{StatusCode: http.StatusBadRequest, Message: "Unexpected EOF."}
 }
 
-func Serveclient(conn net.Conn) {
-	defer conn.Close() // Ensures the connection is close when the function exits
+func Serveclient(conn net.Conn) error {
+	defer conn.Close()
 	buff := &Dynbuff{data: bytes.Buffer{}, length: 0}
-	reader := bytes.NewReader(nil) // Initiates a new Reader function for the buffer
 
 	for {
-		// Trying to get one message from the buffer
 		message, found := SplitMessage(buff)
 		if !found {
-			// Need more data
-			data := make([]byte, 1024) // Buffer size is 1024
-			length := len(data)
+			data := make([]byte, 1024)
 			n, err := conn.Read(data)
 			if err != nil {
 				if err != io.EOF {
 					fmt.Println("Error reading from connection:", err)
-					return // Connection closed or error occured
+					return err
 				}
+				fmt.Println("Client disconnected")
+				return nil
 			}
 			if n > 0 {
-				bytebuffer := bytes.NewBuffer(data[:n]) // creates a new buffer for the byte slice (from the beginning of the slice to n)
-				Buffpush(buff, bytebuffer)
-				if length == 0 && buff.length == 0 {
-					return // no more requests
-				}
-
-				if length == 0 {
-					err := StatusError()
-					if err != nil {
-						// Handle the error
-						fmt.Println(err)
-						// Check if the error is an HTTPError and handle accordingly
-						if httpErr, ok := err.(*HTTPerror); ok {
-							fmt.Printf("HTTP error: status code %d, message %s\n", httpErr.StatusCode, httpErr.Message)
-						}
-					}
-				}
-
-				// Update the reader to reflect the new buffer content
-				reader.Reset(buff.data.Bytes()) // Resets the byte slice to be reading from "buff.data.Bytes()"
-				continue                        // Get some more data and try again
+				Buffpush(buff, bytes.NewBuffer(data[:n]))
+				continue
 			}
-			fmt.Println("Client disconnected.")
-			return
+			fmt.Println("Client disconnected (no new data).")
+			return nil
 		}
-		if bytes.Equal(message, []byte("quit\n")) { // checks if message and []byte("quit\n") is the same length and contain the same bytes
-			_, err := conn.Write([]byte("Bye.\n")) // Writes "Bye" to the connection
+
+		// Handle echo protocol commands first
+		if bytes.Equal(message, []byte("quit\n")) {
+			_, err := conn.Write([]byte("Bye.\n"))
 			if err != nil {
 				fmt.Println("Error writing to connection:", err)
 			}
-			return
-		} else {
-			reply := bytes.Join([][]byte{[]byte("Echo: "), message}, nil) // concatenates both slices
+			return nil
+		}
+
+		// Try to parse as HTTP request
+		requestReader := bufio.NewReader(bytes.NewReader(message))
+		httpRequest, err := http.ReadRequest(requestReader)
+		if err != nil {
+			// If not HTTP, treat as echo protocol
+			reply := append([]byte("Echo: "), message...)
 			_, err := conn.Write(reply)
 			if err != nil {
 				fmt.Println("Error writing to connection:", err)
+				return err
 			}
+			continue
 		}
 
-		// Process the message and send the response
-		Messages := bytes.NewBuffer(message)
-		Request := io.NopCloser(Messages)
+		// Handle HTTP request
+		requestBody := ReadFromRequest(conn, buff, httpRequest)
+		if requestBody == nil {
+			fmt.Println("Failed to read request body")
+			continue
+		}
 
-		requestBody := ReadFromRequest(conn, buff, Request)
-	} // Loops end here
+		resp, err := handleReq(httpRequest, io.NopCloser(requestBody.read))
+		if err != nil {
+			fmt.Println("Error handling request:", err)
+			continue
+		}
+
+		err = writeHTTPResponse(conn, resp)
+		if err != nil {
+			fmt.Println("Error writing response:", err)
+			return err
+		}
+
+		resp.Body.Close()
+	}
 }
 
 // Body Reader from an HTTP request
@@ -155,11 +163,12 @@ func ReadFromRequest(conn net.Conn, buff *Dynbuff, req *http.Request) *BodyReade
 	Chunked := req.TransferEncoding
 
 	bodyAllowed := !(req.Method == "GET" || req.Method == "HEAD")
+	bodyBuffer := &bytes.Buffer{} // Use a separate buffer for the request body
 
 	if bodyAllowed {
 		if ContentLen > 0 {
 			// "content-length" is present
-			n, err := io.CopyN(&buff.data, conn, ContentLen)
+			n, err := io.CopyN(bodyBuffer, conn, ContentLen)
 			if err != nil {
 				fmt.Printf("Error reading content-length body: %v\n", err)
 				// Consider returning an error or a nil BodyReader here
@@ -189,6 +198,7 @@ func ReadFromRequest(conn net.Conn, buff *Dynbuff, req *http.Request) *BodyReade
 					return &BodyReader{read: nil}
 				}
 			} else {
+				// No Content-Length and not chunked
 				err := StatusError()
 				if err != nil {
 					fmt.Println(err)
@@ -198,7 +208,7 @@ func ReadFromRequest(conn net.Conn, buff *Dynbuff, req *http.Request) *BodyReade
 					return &BodyReader{read: nil}
 				}
 				// Handle case with no Content-Length and not chunked (e.g., read until EOF)
-				n, err := io.Copy(&buff.data, conn)
+				n, err := io.Copy(bodyBuffer, conn)
 				if err != nil {
 					fmt.Printf("Error reading until EOF: %v\n", err)
 					return &BodyReader{read: nil}
@@ -217,7 +227,7 @@ func ReadFromRequest(conn net.Conn, buff *Dynbuff, req *http.Request) *BodyReade
 				return &BodyReader{read: nil}
 			}
 			// Consider how to handle this case - perhaps read until EOF?
-			n, err := io.Copy(&buff.data, conn)
+			n, err := io.Copy(bodyBuffer, conn)
 			if err != nil {
 				fmt.Printf("Error reading until EOF: %v\n", err)
 				return &BodyReader{read: nil}
@@ -226,6 +236,88 @@ func ReadFromRequest(conn net.Conn, buff *Dynbuff, req *http.Request) *BodyReade
 		}
 	}
 
-	bodyReader := &BodyReader{read: &buff.data} // Assuming Dynbuff has an underlying byte slice
+	bodyReader := &BodyReader{read: bodyBuffer} // Assuming Dynbuff has an underlying byte slice
 	return bodyReader
+}
+
+func readerFromMemory(data []byte) io.ReadCloser {
+	return io.NopCloser(bytes.NewBuffer(data)) // NopCloser returns a ReadCloser with a no-op Close method wrapping the provided Reader data.
+}
+
+func handleReq(req *http.Request, body io.ReadCloser) (*http.Response, error) {
+	var respBody io.ReadCloser
+
+	switch req.URL.Path {
+	case "/echo":
+		respBody = body // Directly use the request body for echo
+	default:
+		respBody = readerFromMemory([]byte("hello world.\n"))
+		// It's important to close the original body if you're not using it
+		if body != nil {
+			err := body.Close()
+			if err != nil {
+				fmt.Println("Error closing request body:", err)
+			}
+		}
+	}
+
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header: http.Header{
+			"Server": []string{"my_first_http_server"},
+		},
+		Body: respBody,
+	}
+
+	return resp, nil
+}
+
+func newConn(conn net.Conn) {
+	defer conn.Close()
+
+	err := Serveclient(conn) // Assuming Serveclient now returns an error
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "exception: %v\n", err)
+
+		var httpErr *HTTPerror
+		if errors.As(err, &httpErr) {
+			// intended to send an error response
+			resp := &http.Response{
+				StatusCode: httpErr.StatusCode,                               // Corrected field name
+				Header:     make(http.Header),                                // Initialize Header as a map
+				Body:       readerFromMemory([]byte(httpErr.Message + "\n")), // Corrected field name
+			}
+			resp.Header.Set("Content-Type", "text/plain") // Set the Content-Type header
+
+			// Manually write the HTTP response to the connection
+			err := writeHTTPResponse(conn, resp)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "error writing HTTP response: %v\n", err)
+			}
+		}
+	}
+}
+
+func writeHTTPResponse(conn net.Conn, resp *http.Response) error {
+	_, err := fmt.Fprintf(conn, "HTTP/1.1 %d %s\r\n", resp.StatusCode, http.StatusText(resp.StatusCode))
+	if err != nil {
+		return err
+	}
+	for key, values := range resp.Header {
+		for _, value := range values {
+			_, err := fmt.Fprintf(conn, "%s: %s\r\n", key, value)
+			if err != nil {
+				return err
+			}
+		}
+	}
+	_, err = fmt.Fprintf(conn, "\r\n") // End of headers
+	if err != nil {
+		return err
+	}
+	_, err = io.Copy(conn, resp.Body)
+	if err != nil {
+		return err
+	}
+	return resp.Body.Close()
 }

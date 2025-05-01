@@ -17,17 +17,20 @@ func main() {
 		os.Exit(1)
 	}
 	defer listener.Close()
-	fmt.Printf("Listening on %s:%s\n", "tcp", listener.Addr())
+	fmt.Printf("TCP Server listening on %s\n", listener.Addr())
 
 	// Accepting new connections on the listening socket
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			fmt.Printf("Error creating a new connection: %v\n", err)
+			fmt.Printf("Error accepting new connection: %v\n", err)
 			continue // Continue listening for more connections
 		}
 
 		fmt.Printf("Accepted connection from: %s\n", conn.RemoteAddr())
+
+		// Handle each connection in a separate goroutine
 		go Serveclient(conn)
 	}
 }
+
