@@ -8,15 +8,10 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"os"
+	"syscall"
 )
 
 // A parsed HTTP request header
-
-type BodyReader struct {
-	// length int
-	read io.Reader
-}
 
 type HTTPerror struct {
 	StatusCode int
@@ -43,13 +38,15 @@ func Buffpush(buff *Dynbuff, data *bytes.Buffer) { // This pushes data to the bu
 }
 
 func SplitMessage(buff *Dynbuff) ([]byte, bool) { // SplitMessage() processes the Dynbuff to extract complete messages separated by the newline character (\n)
+	// fmt.Printf("SplitMessage: buff.length=%d, buff.data.Cap()=%d, buff.data.Len()=%d\n", buff.length, buff.data.Cap(), buff.data.Len())
 	index := bytes.IndexByte(buff.data.Bytes()[:buff.length], '\n') // locate the first occurence (first index) of the newline char (\n)
 
 	if index == -1 { // Incomplete message: newline not found
 		return nil, false
 	}
 
-	message := make([]byte, index+1)  // Creates a new Buffer containing the message up to (and including) the newline
+	message := make([]byte, index+1) // Creates a new Buffer containing the message up to (and including) the newline
+	// fmt.Printf("SplitMessage: index=%d, attempting to create message of size %d\n", index, len(message))
 	_, err := buff.data.Read(message) // This advances the buffer read pointer
 	if err != nil {
 		return nil, false // should not happen if the buffer is within bounds
@@ -71,9 +68,9 @@ func Buffpop(buff *Dynbuff, length int) {
 	}
 
 	remaining := buff.data.Bytes()[length:] // This effectively represents the data that remains after you conceptually remove the first length bytes.
-	newBuffer := bytes.NewBuffer(remaining) // This creates and initialize a new buffer from the remaining data
-	buff.data = *newBuffer
-	buff.length -= length // buff.length is updated by subtracting the number(len) of bytes from it
+	copy(buff.data.Bytes(), remaining)      // Copy remaining data to the beginning
+	buff.length -= length                   // buff.length is updated by subtracting the number(len) of bytes from it
+	buff.data.Truncate(buff.length)         // Truncate the buffer to the new length
 }
 
 func (e *HTTPerror) Error() string {
@@ -85,7 +82,7 @@ func StatusError() error {
 	return &HTTPerror{StatusCode: http.StatusBadRequest, Message: "Unexpected EOF."}
 }
 
-func Serveclient(conn net.Conn) error {
+func Serveclient(conn net.Conn) {
 	defer conn.Close()
 	buff := &Dynbuff{data: bytes.Buffer{}, length: 0}
 
@@ -97,86 +94,106 @@ func Serveclient(conn net.Conn) error {
 			if err != nil {
 				if err != io.EOF {
 					fmt.Println("Error reading from connection:", err)
-					return err
 				}
 				fmt.Println("Client disconnected")
-				return nil
+				return // Exit goroutine on read error or disconnect
 			}
 			if n > 0 {
 				Buffpush(buff, bytes.NewBuffer(data[:n]))
 				continue
 			}
 			fmt.Println("Client disconnected (no new data).")
-			return nil
+			return // Exit goroutine on disconnect
 		}
 
-		// Handle echo protocol commands first
+		// Handle "quit" command for echo protocol
 		if bytes.Equal(message, []byte("quit\n")) {
 			_, err := conn.Write([]byte("Bye.\n"))
 			if err != nil {
 				fmt.Println("Error writing to connection:", err)
 			}
-			return nil
+			return // Exit goroutine after sending "Bye."
 		}
 
 		// Try to parse as HTTP request
 		requestReader := bufio.NewReader(bytes.NewReader(message))
 		httpRequest, err := http.ReadRequest(requestReader)
-		if err != nil {
-			// If not HTTP, treat as echo protocol
+		if err == nil {
+			// Successfully parsed as HTTP
+			requestBody, err := ReadFromRequest(conn, httpRequest)
+			if err != nil {
+				fmt.Println("Error reading request body:", err)
+				continue // Or handle error by sending HTTP error response
+			}
+			if requestBody == nil {
+				fmt.Println("Failed to read request body (nil reader)")
+				continue // Or handle error by sending HTTP error response
+			}
+			defer func() {
+				if closer, ok := requestBody.(io.Closer); ok {
+					closer.Close()
+				}
+			}()
+
+			resp, err := handleReq(httpRequest, requestBody)
+			if err != nil {
+				fmt.Println("Error handling request:", err)
+				continue // Or handle error by sending HTTP error response
+			}
+
+			err = writeHTTPResponse(conn, resp)
+			if err != nil {
+				if ne, ok := err.(net.Error); ok && ne.Timeout() {
+					fmt.Println("Write timeout:", err)
+					return // Exit goroutine on write timeout
+				} else if errors.Is(err, syscall.EPIPE) || errors.Is(err, io.ErrClosedPipe) {
+					fmt.Println("Error writing response (broken pipe):", err)
+					return // Exit goroutine on broken pipe
+				} else {
+					fmt.Println("Error writing response:", err)
+					return // Exit goroutine on other write errors
+				}
+			}
+			resp.Body.Close()
+			continue // Continue to the next message/request
+		} else {
+			// Not a valid HTTP request, treat as a simple echo
 			reply := append([]byte("Echo: "), message...)
 			_, err := conn.Write(reply)
 			if err != nil {
-				fmt.Println("Error writing to connection:", err)
-				return err
+				if ne, ok := err.(net.Error); ok && ne.Timeout() {
+					fmt.Println("Write timeout:", err)
+					return // Exit goroutine on write timeout
+				} else if errors.Is(err, syscall.EPIPE) || errors.Is(err, io.ErrClosedPipe) {
+					fmt.Println("Error writing echo response (broken pipe):", err)
+					return // Exit goroutine on broken pipe
+				} else {
+					fmt.Println("Error writing echo response:", err)
+					return // Exit goroutine on other write errors
+				}
 			}
-			continue
 		}
-
-		// Handle HTTP request
-		requestBody := ReadFromRequest(conn, buff, httpRequest)
-		if requestBody == nil {
-			fmt.Println("Failed to read request body")
-			continue
-		}
-
-		resp, err := handleReq(httpRequest, io.NopCloser(requestBody.read))
-		if err != nil {
-			fmt.Println("Error handling request:", err)
-			continue
-		}
-
-		err = writeHTTPResponse(conn, resp)
-		if err != nil {
-			fmt.Println("Error writing response:", err)
-			return err
-		}
-
-		resp.Body.Close()
 	}
 }
 
 // Body Reader from an HTTP request
 
-func ReadFromRequest(conn net.Conn, buff *Dynbuff, req *http.Request) *BodyReader {
+func ReadFromRequest(conn net.Conn, req *http.Request) (io.ReadCloser, error) {
 	ContentLen := req.ContentLength
 	Chunked := req.TransferEncoding
-
 	bodyAllowed := !(req.Method == "GET" || req.Method == "HEAD")
-	bodyBuffer := &bytes.Buffer{} // Use a separate buffer for the request body
+	bodyBuffer := &bytes.Buffer{}
 
 	if bodyAllowed {
 		if ContentLen > 0 {
-			// "content-length" is present
 			n, err := io.CopyN(bodyBuffer, conn, ContentLen)
 			if err != nil {
-				fmt.Printf("Error reading content-length body: %v\n", err)
-				// Consider returning an error or a nil BodyReader here
-				return &BodyReader{read: nil}
+				return nil, fmt.Errorf("error reading content-length body: %v", err)
 			}
 			if n < ContentLen {
 				fmt.Printf("Warning: Read %d bytes, expected %d\n", n, ContentLen)
 			}
+			return io.NopCloser(bodyBuffer), nil
 		} else if len(Chunked) > 0 {
 			isChunked := false
 			for _, enc := range Chunked {
@@ -186,58 +203,23 @@ func ReadFromRequest(conn net.Conn, buff *Dynbuff, req *http.Request) *BodyReade
 				}
 			}
 			if isChunked {
-				// Chunked encoding - you'll need to implement chunked decoding here
-				fmt.Println("Chunked encoding detected, needs implementation") // COME BACK TO THIS
-				// You would typically use a bufio.Reader on the conn and parse chunks
-				err := StatusError()
-				if err != nil {
-					fmt.Println(err)
-					if httpErr, ok := err.(*HTTPerror); ok {
-						fmt.Printf("HTTP error: status code %d, message %s\n", httpErr.StatusCode, httpErr.Message)
-					}
-					return &BodyReader{read: nil}
-				}
+				fmt.Println("Chunked encoding detected, needs implementation")
+				return nil, errors.New("chunked encoding not implemented")
 			} else {
-				// No Content-Length and not chunked
-				err := StatusError()
-				if err != nil {
-					fmt.Println(err)
-					if httpErr, ok := err.(*HTTPerror); ok {
-						fmt.Printf("HTTP error: status code %d, message %s\n", httpErr.StatusCode, httpErr.Message)
-					}
-					return &BodyReader{read: nil}
-				}
-				// Handle case with no Content-Length and not chunked (e.g., read until EOF)
+				fmt.Println("No Content-Length and not chunked, but Transfer-Encoding present (not chunked)")
 				n, err := io.Copy(bodyBuffer, conn)
 				if err != nil {
-					fmt.Printf("Error reading until EOF: %v\n", err)
-					return &BodyReader{read: nil}
+					return nil, fmt.Errorf("error reading until EOF: %v", err)
 				}
 				fmt.Printf("Read %d bytes until EOF\n", n)
+				return io.NopCloser(bodyBuffer), nil
 			}
 		} else {
-			// No Content-Length and not chunked for a method that allows a body
-			// This might indicate an error or a client sending data without proper headers
-			err := StatusError()
-			if err != nil {
-				fmt.Println(err)
-				if httpErr, ok := err.(*HTTPerror); ok {
-					fmt.Printf("HTTP error: status code %d, message %s\n", httpErr.StatusCode, httpErr.Message)
-				}
-				return &BodyReader{read: nil}
-			}
-			// Consider how to handle this case - perhaps read until EOF?
-			n, err := io.Copy(bodyBuffer, conn)
-			if err != nil {
-				fmt.Printf("Error reading until EOF: %v\n", err)
-				return &BodyReader{read: nil}
-			}
-			fmt.Printf("Read %d bytes until EOF (no headers)\n", n)
+			fmt.Println("No Content-Length or Transfer-Encoding for body-allowed method")
+			return io.NopCloser(bytes.NewBuffer(nil)), nil // Empty reader
 		}
 	}
-
-	bodyReader := &BodyReader{read: bodyBuffer} // Assuming Dynbuff has an underlying byte slice
-	return bodyReader
+	return io.NopCloser(bytes.NewBuffer(nil)), nil // No body allowed
 }
 
 func readerFromMemory(data []byte) io.ReadCloser {
@@ -270,32 +252,6 @@ func handleReq(req *http.Request, body io.ReadCloser) (*http.Response, error) {
 	}
 
 	return resp, nil
-}
-
-func newConn(conn net.Conn) {
-	defer conn.Close()
-
-	err := Serveclient(conn) // Assuming Serveclient now returns an error
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "exception: %v\n", err)
-
-		var httpErr *HTTPerror
-		if errors.As(err, &httpErr) {
-			// intended to send an error response
-			resp := &http.Response{
-				StatusCode: httpErr.StatusCode,                               // Corrected field name
-				Header:     make(http.Header),                                // Initialize Header as a map
-				Body:       readerFromMemory([]byte(httpErr.Message + "\n")), // Corrected field name
-			}
-			resp.Header.Set("Content-Type", "text/plain") // Set the Content-Type header
-
-			// Manually write the HTTP response to the connection
-			err := writeHTTPResponse(conn, resp)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "error writing HTTP response: %v\n", err)
-			}
-		}
-	}
 }
 
 func writeHTTPResponse(conn net.Conn, resp *http.Response) error {
